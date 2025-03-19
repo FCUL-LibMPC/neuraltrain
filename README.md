@@ -2,16 +2,16 @@
 
 NeuralTrain is a lightweight and extensible framework for training neural networks, designed to streamline the process of hyperparameter optimization, distributed training, and checkpointing. It integrates seamlessly with **Optuna** for hyperparameter tuning and supports **multiprocessing** for  parallel training.
 
-## 📌 Index
+## Index
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Configuration](#configuration)
-- [Results and Logs](#results-and-logs)
+- [Contributing](#contributing)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
-## 🚀 Features
+## Features
 - **Flexible Neural Network Training** with an extendable base class (`NeuralTrainBase`).
 - **Hyperparameter Optimization** using **Optuna**.
 - **Parallel Training Support** with multiprocessing.
@@ -20,7 +20,7 @@ NeuralTrain is a lightweight and extensible framework for training neural networ
 
 ---
 
-## 🔧 Installation
+## Installation
 
 You can install **NeuralTrain** directly from GitHub:
 
@@ -30,7 +30,7 @@ pip install git+https://github.com/FCUL-LibMPC/neuraltrain.git
 
 ---
 
-## ⚡ Usage
+## Usage
 
 ### **1️⃣ Extending the Base Class**
 To use **NeuralTrain**, create a class that inherits from `NeuralTrainBase` and implement the `objective` method:
@@ -76,37 +76,13 @@ trainer.distributed_run(n_processes=4)
 
 ---
 
-## 🛠 Project Structure
-
-```
-neuraltrain/
-│── src/
-│   ├── neuraltrain/
-│   │   ├── __init__.py
-│   │   ├── trainer.py
-│── tests/
-│── setup.py
-│── pyproject.toml
-│── requirements.txt
-│── README.md
-│── LICENSE
-│── .gitignore
-```
-
----
-
-## 📜 License
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🤝 Contributing
+## Contributing
 Contributions, issues, and feature requests are welcome!  
 Feel free to submit a PR or open an issue on GitHub.
 
 ---
 
-## ⭐ Acknowledgments
+## Acknowledgments
 - [Optuna](https://optuna.org/) - Hyperparameter tuning.
 
 ---

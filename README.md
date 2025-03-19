@@ -15,25 +15,17 @@ NeuralTrain is a lightweight and extensible framework for training neural networ
 - **Flexible Neural Network Training** with an extendable base class (`NeuralTrainBase`).
 - **Hyperparameter Optimization** using **Optuna**.
 - **Parallel Training Support** with multiprocessing.
-- **Automatic Trial Recovery** – failed trials (due to crasher or power outages) are re-enqueued.
+- **Automatic Trial Recovery** – failed trials (due to crashes or power outages) are re-enqueued.
 - **Checkpointing** – offers tools for creating/loading checkpoints.
 
 ---
 
 ## 🔧 Installation
-Clone the repository:
-
-```sh
-git clone https://github.com/alxgeraldo/neuraltrain.git
-cd neuraltrain
-```
-
-Install dependencies:
 
 You can install **NeuralTrain** directly from GitHub:
 
 ```sh
-pip install git+https://github.com/alxgeraldo/neuraltrain.git
+pip install git+https://github.com/FCUL-LibMPC/neuraltrain.git
 ```
 
 ---

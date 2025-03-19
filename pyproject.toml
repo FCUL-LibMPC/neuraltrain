@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuraltrain"
+version = "0.1.0"
+description = "A neural network training framework leveraging Optuna for hyperparameter optimization and parallelism."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Alexandre Geraldo", email = "alexgeraldo.aeos@gmail.com"}]
+requires-python = ">=3.11"
+
+[project.urls]
+Homepage = "https://github.com/FCUL-LibMPC/neuraltrain"
+Repository = "https://github.com/FCUL-LibMPC/neuraltrain"

@@ -1,3 +1,7 @@
+## [0.3.0] - 2025-03-26
+### Added
+- Added a `preprocessing` module with functions to normalize and denormalize temperature and radiation data.
+
 ## [0.2.1] - 2025-03-26
 ### Changed
 - Exposed `TimeSeriesDataset` and related components via `__init__.py` for easier importing.

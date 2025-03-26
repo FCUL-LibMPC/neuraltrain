@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="neuraltrain",
-    version="0.2.1",
+    version="0.3.0",
     author="Alexandre Geraldo",
     author_email="alexgeraldo@gmail.com",
     description="A neural network training framework leveraging Optuna for hyperparameter optimization and parallelism.",

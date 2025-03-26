@@ -9,7 +9,7 @@ description = "A neural network training framework leveraging Optuna for hyperpa
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Alexandre Geraldo", email = "alexgeraldo.aeos@gmail.com"}]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 
 [project.urls]
 Homepage = "https://github.com/FCUL-LibMPC/neuraltrain"

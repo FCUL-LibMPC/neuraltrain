@@ -1,3 +1,7 @@
+## [0.3.2] - 2025-03-26
+### Added
+- Exposed `preprocessing` module and related components via `__init__.py` for easier importing.
+
 ## [0.3.1] - 2025-03-26
 ### Added
 - Added a denormalize function for MSE values in `preprocessing` module.

@@ -85,6 +85,22 @@ def denormalize_radiation(
     return (radiation - min_val) / (max_val - min_val) * (max_rad - min_rad) + min_rad
 
 
+def denormalize_mse(normalized_mse, original_range: tuple) -> float:
+    """
+    Convert MSE from normalized [0, 1] scale back to the original Celsius^2 scale.
+
+    Args:
+        normalized_mse (float | Tensor): The MSE in the normalized space (between 0 and 1).
+        original_range (tuple): Tuple containing the minimum and maximum values used for normalization.
+
+    Returns:
+        float | Tensor: MSE in the original Celsius^2 scale.
+    """
+    min_val, max_val = original_range
+    value_range = max_val - min_val
+    return normalized_mse * (value_range**2)
+
+
 class NormalizeFeatures(BaseEstimator, TransformerMixin):
     def fit(self, df, y=None):
         return self

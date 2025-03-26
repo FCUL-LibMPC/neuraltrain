@@ -1,3 +1,7 @@
+## [0.3.1] - 2025-03-26
+### Added
+- Added a denormalize function for MSE values in `preprocessing` module.
+
 ## [0.3.0] - 2025-03-26
 ### Added
 - Added a `preprocessing` module with functions to normalize and denormalize temperature and radiation data.

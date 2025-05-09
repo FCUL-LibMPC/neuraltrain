@@ -9,6 +9,12 @@ import sqlite3
 import tempfile
 from typing import List, Dict, Any
 import logging
+import torch
+from .dataloaders import TimeSeriesDataset, DataLoader, Dataset
+from torchmetrics.regression import MeanAbsoluteError, R2Score, MeanSquaredError
+import pandas as pd
+import wandb
+from typing import Callable
 
 
 class NeuralTrainerBase(ABC):
@@ -20,6 +26,8 @@ class NeuralTrainerBase(ABC):
         study_name: str,
         n_trials: int,
         output_dir: Path,
+        model,
+        optimizer,
         sampler=None,
         pruner=None,
         debug_mode=False,
@@ -30,6 +38,8 @@ class NeuralTrainerBase(ABC):
         self.__n_trials = n_trials
         self.__output_dir = output_dir
         self.__debug_mode = debug_mode
+        self.__model_class: torch.nn.Module = model
+        self.__optimizer_class = optimizer
 
         # Setting up the logger
         self.logger = logging.getLogger("NeuralTrainBase")
@@ -315,6 +325,363 @@ class NeuralTrainerBase(ABC):
             f"Re-enqueued {affected_rows} failed trial(s) in study '{self.__study_name}'."
         )
 
+    def __check_trial_params(self, params: Dict[str, Any]) -> None:
+        """Raise descriptive errors for invalid hyperparameter values."""
+        tp = params["train_proportion"]
+        if not 0.0 < tp < 1.0:
+            raise ValueError(
+                f"Invalid train_proportion: {tp}. Must be between 0 and 1 (exclusive)."
+            )
+
+        bs = params["batch_size"]
+        if not isinstance(bs, int) or bs <= 0:
+            raise ValueError(f"Invalid batch_size: {bs}. Must be a positive integer.")
+
+        hl1, hl2 = params["hidden_dims"]
+        if not all(isinstance(h, int) and h > 0 for h in (hl1, hl2)):
+            raise ValueError(
+                f"Invalid hidden layer dimensions: {params['hidden_dims']}."
+            )
+
+        lr = params["learning_rate"]
+        if not (0 < lr < 1):
+            raise ValueError(f"Learning rate too high or invalid: {lr}.")
+
+        wd = params["weight_decay"]
+        if not (0 <= wd < 1):
+            raise ValueError(f"Weight decay invalid: {wd}. Must be >= 0 and < 1.")
+
+    def loss_function(self) -> torch.nn.Module:
+        """
+        Returns the loss function to be used in training.
+
+        By default, this uses Mean Squared Error loss (MSE), which is
+        common for regression tasks. Override this method in subclasses
+        to customize the loss function.
+
+        Returns:
+            torch.nn.Module: The loss function instance.
+        """
+        return torch.nn.MSELoss()
+
+    def train(
+        self,
+        model: torch.nn.Module,
+        loss_fn: Callable,
+        train_dl: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+    ):
+        # Normalized metrics
+        r2_metric = R2Score().to(device)
+        mae_metric = MeanAbsoluteError().to(device)
+        mse_metric = MeanSquaredError().to(device)
+
+        # New: Denormalized metrics
+        mae_real_metric = MeanAbsoluteError().to(device)
+        mse_real_metric = MeanSquaredError().to(device)
+
+        model.train()
+        for inputs, targets in train_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+
+            loss = loss_fn(outputs, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Normalized updates
+            r2_metric.update(outputs, targets)
+            mae_metric.update(outputs, targets)
+            mse_metric.update(outputs, targets)
+
+            # Desnormalize (assumindo radiação entre 0 e 1000)
+            outputs_real = self.denormalize(outputs)
+            targets_real = self.denormalize(targets)
+
+            # Real updates
+            mae_real_metric.update(outputs_real, targets_real)
+            mse_real_metric.update(outputs_real, targets_real)
+
+        return {
+            "train/mse": mse_metric.compute().item(),
+            "train/mae": mae_metric.compute().item(),
+            "train/r2": r2_metric.compute().item(),
+            "train/mse_real": mse_real_metric.compute().item(),
+            "train/mae_real": mae_real_metric.compute().item(),
+        }
+
+    def evaluate(
+        self, model: torch.nn.Module, test_dl: DataLoader, device: torch.device
+    ):
+        # Normalized metrics
+        r2_metric = R2Score().to(device)
+        mae_metric = MeanAbsoluteError().to(device)
+        mse_metric = MeanSquaredError().to(device)
+
+        # New: Denormalized metrics
+        mae_real_metric = MeanAbsoluteError().to(device)
+        mse_real_metric = MeanSquaredError().to(device)
+
+        model.eval()
+        with torch.no_grad():
+            for inputs, targets in test_dl:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+
+                # Update normalized metrics
+                r2_metric.update(outputs, targets)
+                mae_metric.update(outputs, targets)
+                mse_metric.update(outputs, targets)
+
+                # Desnormalize (assumindo que é radiação solar normalizada de 0 a 1000)
+                outputs_real = self.denormalize(outputs)
+                targets_real = self.denormalize(targets)
+
+                # Update real metrics
+                mae_real_metric.update(outputs_real, targets_real)
+                mse_real_metric.update(outputs_real, targets_real)
+
+        return {
+            "evaluate/mse": mse_metric.compute().item(),
+            "evaluate/mae": mae_metric.compute().item(),
+            "evaluate/r2": r2_metric.compute().item(),
+            "evaluate/mse_real": mse_real_metric.compute().item(),
+            "evaluate/mae_real": mae_real_metric.compute().item(),
+        }
+
+    def objective(
+        self,
+        trial: optuna.Trial,
+        hidden_dims: list,
+        input_dim: int,
+        output_dim: int,
+        epochs: int,
+        learning_rate: float,
+        weight_decay: float,
+        df_path: str,
+        train_proportion: float,
+        batch_sizes: list,
+        output_dir: str,
+        study_name: str,
+    ) -> float:
+        """Objective function to optimize. To be implemented in child classes."""
+
+        # Setup PyTorch device
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{trial.number % torch.cuda.device_count()}")
+        else:
+            device = torch.device("cpu")
+
+        # Look for existing trials and checkpoints
+        if trial.user_attrs:
+            try:
+                # Load the relevant checkpoint attributes
+                checkpoint_path = Path(trial.user_attrs["checkpoint_path"])
+                hidden_dim_1, hidden_dim_2 = trial.user_attrs["hidden_dims"]
+                batch_size = trial.user_attrs["batch_size"]
+                learning_rate = trial.user_attrs["learning_rate"]
+                weight_decay = trial.user_attrs["weight_decay"]
+                input_dim = trial.user_attrs["input_dim"]
+                output_dim = trial.user_attrs["output_dim"]
+                wandb_id = trial.user_attrs["wandb_id"]
+                wandb_name = trial.user_attrs["wandb_name"]
+                epochs = trial.user_attrs["epochs"]
+                train_proportion = trial.user_attrs["train_proportion"]
+
+                self.logger.info(
+                    f"Loading checkpoint from: {checkpoint_path} for trial {trial.number} (hidden_dims={hidden_dims})..."
+                )
+
+                # Load the checkpoint
+                checkpoint = self.load_checkpoint(checkpoint_path)
+
+                # Check if the checkpoint is valid and has all the fields
+                if checkpoint:
+                    # Initialize the model and optimizer
+                    model: torch.nn.Module = self.__model_class(
+                        input_dim, hidden_dim_1, hidden_dim_2, output_dim
+                    ).to(device)
+
+                    optimizer: torch.optim.Optimizer = self.__optimizer_class(
+                        model.parameters(),
+                        lr=learning_rate,
+                        weight_decay=weight_decay,
+                    )
+
+                    # Load the model and optimizer states from checkpoint
+                    model.load_state_dict(checkpoint["model_state_dict"])
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+                    # Load progress variables
+                    starting_epoch = checkpoint["epoch"]
+                    best_model_loss = checkpoint["best_model_loss"]
+                    best_model_state = checkpoint["best_model_state"]
+                    best_model_parameters = checkpoint["best_model_parameters"]
+
+                    self.logger.info(
+                        f"Checkpoint loaded. Resuming training from epoch {starting_epoch}."
+                    )
+                else:
+                    self.logger.error(
+                        f"Missing or invalid checkpoint for trial {trial.number}. Aborting with an error."
+                    )
+                    raise RuntimeError(
+                        f"Checkpoint is empty or invalid for trial {trial.number}."
+                    )
+
+            except Exception as e:
+                self.logger.error(f"Failed to resume trial {trial.number}: {e}")
+                raise RuntimeError(
+                    f"Failed to load checkpoint for trial {trial.number}"
+                ) from e
+        else:
+            # No valid checkpoint, setup the trial
+            self.logger.info(f"🔄 Setting up trial {trial.number} from scratch.")
+            trial_info = self.setup_trial(
+                trial,
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dims=hidden_dims,
+                batch_sizes=batch_sizes,
+                epochs=epochs,
+                train_proportion=train_proportion,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+            )
+
+            # Check if the trial_info is valid
+            self.__check_trial_params(trial_info)
+
+            # Unpack everything from trial_info
+            hidden_dim_1, hidden_dim_2 = trial_info["hidden_dims"]
+            batch_size = trial_info["batch_size"]
+            learning_rate = trial_info["learning_rate"]
+            weight_decay = trial_info["weight_decay"]
+            input_dim = trial_info["input_dim"]
+            output_dim = trial_info["output_dim"]
+            epochs = trial_info["epochs"]
+            train_proportion = trial_info["train_proportion"]
+            checkpoint_path = Path(trial_info["checkpoint_path"])
+            wandb_id = trial_info["wandb_id"]
+            wandb_name = trial_info["wandb_name"]
+
+            model = self.__model_class(
+                input_dim, hidden_dim_1, hidden_dim_2, output_dim
+            ).to(device)
+            optimizer = self.__optimizer_class(
+                model.parameters(), lr=learning_rate, weight_decay=weight_decay
+            )
+
+            starting_epoch = 0
+            best_model_loss = float("inf")
+            best_model_state = None
+            best_model_parameters = []
+
+            model: torch.nn.Module = self.__model_class(
+                input_dim, hidden_dim_1, hidden_dim_2, output_dim
+            ).to(device)
+
+            optimizer: torch.optim.Optimizer = self.__optimizer_class(
+                model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+            )
+
+            # Storing trial information
+            trial.set_user_attr("checkpoint_path", str(checkpoint_path))
+            trial.set_user_attr("hidden_dims", [hidden_dim_1, hidden_dim_2])
+            trial.set_user_attr("batch_size", batch_size)
+            trial.set_user_attr("learning_rate", learning_rate)
+            trial.set_user_attr("weight_decay", weight_decay)
+            trial.set_user_attr("input_dim", input_dim)
+            trial.set_user_attr("output_dim", output_dim)
+            trial.set_user_attr("wandb_id", wandb_id)
+            trial.set_user_attr("wandb_name", wandb_name)
+            trial.set_user_attr("epochs", epochs)
+            trial.set_user_attr("train_proportion", train_proportion)
+
+        # Load and prepare the dataloaders
+        df = pd.read_csv(df_path)
+        train_dl, test_dl = TimeSeriesDataset.get_dataloaders(
+            df,
+            input_col_filter=self.input_col_filter,
+            target_col_filter=self.target_col_filter,
+            train_proportion=train_proportion,
+            batch_size=batch_size,
+        )
+
+        # Initialize Weights and Biases run REFERENCE FOR DISTRIBUTED: https://docs.wandb.ai/support/multiprocessing_eg_distributed_training/
+        run = wandb.init(
+            id=wandb_id,
+            project=study_name,
+            name=wandb_name,
+            group="optuna-multiprocessing",
+            config={
+                "input_dim": input_dim,
+                "output_dim": output_dim,
+                "hidden_dim_layer_1": hidden_dim_1,
+                "hidden_dim_layer_2": hidden_dim_2,
+                "batch_size": batch_size,
+                "train_portion": train_proportion,
+                "evaluation_portion": 1 - train_proportion,
+                "learning_rate": learning_rate,
+                "weight_decay": weight_decay,
+            },
+            reinit=True,
+            dir=output_dir,
+        )
+
+        # Start training loop
+        for epoch in range(starting_epoch, epochs, 1):
+            # Train and evaluate the model
+            train_metrics = self.train(
+                model, self.loss_function(), train_dl, optimizer, device
+            )
+            eval_metrics = self.evaluate(model, test_dl, device)
+
+            # Get the evaluation loss
+            eval_loss = eval_metrics["evaluate/mse"]
+
+            # Save the best model
+            if eval_loss < best_model_loss:
+                best_model_loss = eval_loss
+                best_model_state = model.state_dict()
+                best_model_parameters = [hidden_dim_1, hidden_dim_2, batch_size, epoch]
+
+            # Log information
+            run.log(
+                {
+                    "epoch": epoch + 1,
+                    **train_metrics,
+                    **eval_metrics,
+                },
+                step=epoch + 1,
+            )
+
+            # Save checkpoint every 50 epochs
+            if epoch % 50 == 0:
+                state = {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_model_loss": best_model_loss,
+                    "best_model_state": best_model_state,
+                    "best_model_parameters": best_model_parameters,
+                }
+                self.create_checkpoint(checkpoint_path, state)
+
+        # Store tracked best model
+        hidden_dim, batch_size, epoch = best_model_parameters
+        model_path = (
+            Path(output_dir) / f"model_hl{hidden_dim}_bs{batch_size}_e{epoch+1}.pth"
+        )
+        torch.save(best_model_state, model_path)
+
+        run.finish()
+        return best_model_loss
+
     @property
     def output_dir(self) -> Path:
         return self.__output_dir
@@ -328,6 +695,60 @@ class NeuralTrainerBase(ABC):
         return self.study._study_id
 
     @abstractmethod
-    def objective(self, trial: optuna.Trial, *args) -> float:
-        """Objective function to optimize. To be implemented in child classes."""
-        ...
+    def input_col_filter(self, col: str) -> bool:
+        """Filter function to select input columns based on a condition."""
+        raise NotImplementedError("This method should be overridden in subclasses.")
+
+    @abstractmethod
+    def target_col_filter(self, col: str) -> bool:
+        """Filter function to select target columns based on a condition."""
+        raise NotImplementedError("This method should be overridden in subclasses.")
+
+    @abstractmethod
+    def denormalize(self, data: torch.Tensor) -> torch.Tensor:
+        """Denormalize the data to its original scale."""
+        raise NotImplementedError("This method should be overridden in subclasses.")
+
+    @abstractmethod
+    def setup_trial(
+        self,
+        trial: optuna.Trial,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: List[int] | int,
+        batch_size: List[int] | int,
+        epochs: List[int] | int,
+        train_proportion: List[float] | float,
+        learning_rate: List[float] | float,
+        weight_decay: List[float] | float,
+    ) -> Dict[str, Any]:
+        """
+        Generate the hyperparameters for the given Optuna trial.
+
+        Each argument can be one of:
+        - A **fixed value** (e.g., `epochs=2000`) which will be used as-is.
+        - A **list of options** (e.g., `batch_size=[128, 256, 512]`), where one will be selected using `trial.suggest_categorical`.
+        - A **range** list of two values (e.g., `learning_rate=[1e-4, 1e-2]`), where a value will be sampled using `trial.suggest_float`.
+
+        Example implementation:
+            - `hidden_dims = [64, 256]` → sampled integer from range using `trial.suggest_int`
+            - `batch_size = [256, 512, 1024]` → picked from options using `trial.suggest_categorical`
+            - `epochs = 2000` → used as a fixed value
+            - `train_proportion = [0.6, 0.9]` → sampled float from range using `trial.suggest_float`
+            - `learning_rate = [1e-4, 1e-2]` → sampled from log scale using `trial.suggest_float(log=True)`
+            - `weight_decay = 5e-6` → used as fixed value
+
+        Returns:
+            Dict[str, Any]: Dictionary of resolved parameters to use in the trial, including:
+                - hidden_dims (List[int])
+                - batch_size (int)
+                - epochs (int)
+                - train_proportion (float)
+                - learning_rate (float)
+                - weight_decay (float)
+                - input_dim (int)
+                - output_dim (int)
+                - wandb_id (str)
+                - wandb_name (str)
+        """
+        raise NotImplementedError("This method should be overridden in subclasses.")

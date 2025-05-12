@@ -7,7 +7,6 @@ sys.path.insert(
 
 from neuraltrain import NeuralTrainerBase, parse_cli_args, TimeSeriesDataset
 import torch
-from torchmetrics.regression import MeanAbsoluteError, MeanSquaredError, R2Score
 
 if __name__ == "__main__":
     args = parse_cli_args()

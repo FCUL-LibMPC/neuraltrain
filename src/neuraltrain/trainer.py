@@ -673,9 +673,9 @@ class NeuralTrainerBase(ABC):
                 self.create_checkpoint(checkpoint_path, state)
 
         # Store tracked best model
-        hidden_dim, batch_size, epoch = best_model_parameters
+        hidden_dim_1, hidden_dim_2, batch_size, epoch = best_model_parameters
         model_path = (
-            Path(output_dir) / f"model_hl{hidden_dim}_bs{batch_size}_e{epoch+1}.pth"
+            Path(output_dir) / f"model_1hl{hidden_dim_1}_2hl{hidden_dim_2}_bs{batch_size}_e{epoch+1}.pth"
         )
         torch.save(best_model_state, model_path)
 

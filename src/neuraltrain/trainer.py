@@ -470,9 +470,12 @@ class NeuralTrainerBase(ABC):
 
         # Setup PyTorch device
         if torch.cuda.is_available():
-            device = torch.device(f"cuda:{trial.number % torch.cuda.device_count()}")
+            device_index = trial.number % torch.cuda.device_count()
+            device = torch.device(f"cuda:{device_index}")
+            self.logger.info(f"Using CUDA device: {device} - {torch.cuda.get_device_name(device_index)}")
         else:
             device = torch.device("cpu")
+            self.logger.info("Using CPU")
 
         # Look for existing trials and checkpoints
         if trial.user_attrs:

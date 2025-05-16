@@ -678,7 +678,7 @@ class NeuralTrainerBase(ABC):
         # Store tracked best model
         hidden_dim_1, hidden_dim_2, batch_size, epoch = best_model_parameters
         model_path = (
-            Path(output_dir) / f"model_1hl{hidden_dim_1}_2hl{hidden_dim_2}_bs{batch_size}_e{epoch+1}.pth"
+            Path(output_dir) / f"model_{trial.number}_1hl{hidden_dim_1}_2hl{hidden_dim_2}_bs{batch_size}_e{epoch+1}.pth"
         )
         torch.save(best_model_state, model_path)
 

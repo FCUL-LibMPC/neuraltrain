@@ -15,6 +15,13 @@ from torchmetrics.regression import MeanAbsoluteError, R2Score, MeanSquaredError
 import pandas as pd
 import wandb
 from typing import Callable
+from enum import Enum
+
+class EvaluationMetric(Enum):
+    """Enum for evaluation metrics."""
+    MAE = "mae"
+    MSE = "mse"
+    R2 = "r2"
 
 
 class NeuralTrainerBase(ABC):
@@ -381,7 +388,12 @@ class NeuralTrainerBase(ABC):
         mae_real_metric = MeanAbsoluteError().to(device)
         mse_real_metric = MeanSquaredError().to(device)
 
+        # Initialize loss variables
+        total_loss = 0.0
+        total_samples = 0
+
         model.train()
+
         for inputs, targets in train_dl:
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
@@ -390,6 +402,11 @@ class NeuralTrainerBase(ABC):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            # Accumulate weighted loss
+            batch_size = targets.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
 
             # Normalized updates
             r2_metric.update(outputs, targets)
@@ -405,6 +422,7 @@ class NeuralTrainerBase(ABC):
             mse_real_metric.update(outputs_real, targets_real)
 
         return {
+            "train/loss": total_loss / total_samples,
             "train/mse": mse_metric.compute().item(),
             "train/mae": mae_metric.compute().item(),
             "train/r2": r2_metric.compute().item(),
@@ -420,9 +438,13 @@ class NeuralTrainerBase(ABC):
         mae_metric = MeanAbsoluteError().to(device)
         mse_metric = MeanSquaredError().to(device)
 
-        # New: Denormalized metrics
+        # Denormalized metrics
         mae_real_metric = MeanAbsoluteError().to(device)
         mse_real_metric = MeanSquaredError().to(device)
+
+        # Initialize loss variables
+        total_loss = 0.0
+        total_samples = 0
 
         model.eval()
         with torch.no_grad():
@@ -430,12 +452,20 @@ class NeuralTrainerBase(ABC):
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
 
+                # Compute loss
+                loss = self.loss_function()(outputs, targets)
+
+                # Accumulate weighted loss
+                batch_size = targets.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+
                 # Update normalized metrics
                 r2_metric.update(outputs, targets)
                 mae_metric.update(outputs, targets)
                 mse_metric.update(outputs, targets)
 
-                # Desnormalize (assumindo que é radiação solar normalizada de 0 a 1000)
+                # Denormalize outputs and targets
                 outputs_real = self.denormalize(outputs)
                 targets_real = self.denormalize(targets)
 
@@ -444,12 +474,14 @@ class NeuralTrainerBase(ABC):
                 mse_real_metric.update(outputs_real, targets_real)
 
         return {
+            "evaluate/loss": total_loss / total_samples,
             "evaluate/mse": mse_metric.compute().item(),
             "evaluate/mae": mae_metric.compute().item(),
             "evaluate/r2": r2_metric.compute().item(),
             "evaluate/mse_real": mse_real_metric.compute().item(),
             "evaluate/mae_real": mae_real_metric.compute().item(),
         }
+
 
     def objective(
         self,

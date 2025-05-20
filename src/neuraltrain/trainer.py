@@ -677,7 +677,7 @@ class NeuralTrainerBase(ABC):
             eval_metrics = self.evaluate(model, test_dl, device)
 
             # Get the evaluation loss
-            eval_loss = eval_metrics["evaluate/mse"]
+            eval_loss = eval_metrics["evaluate/loss"]
 
             # Save the best model
             if eval_loss < best_model_loss:

@@ -75,7 +75,7 @@ def parse_cli_args() -> CLIArgs:
         sys.exit(1)
 
     # Prepare output directory
-    output_dir = Path(args.output_dir) / args.train_id
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return CLIArgs(

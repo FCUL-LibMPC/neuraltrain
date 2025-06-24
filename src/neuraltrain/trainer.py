@@ -15,7 +15,7 @@ from .dataloaders import TimeSeriesDataset, DataLoader, Dataset
 from torchmetrics.regression import MeanAbsoluteError, R2Score, MeanSquaredError
 import pandas as pd
 import wandb
-from typing import Callable, Type
+from typing import Type, List
 from enum import Enum
 from torch.nn import Module
 from torch.optim import Optimizer
@@ -94,9 +94,10 @@ class NeuralTrainerBase(ABC):
         output_dir: str,
         model: Type[Module],
         optimizer: Type[Optimizer],
+        output_mapping: List[str],
         sampler=None,
         pruner=None,
-        debug_mode=False
+        debug_mode=False,
     ):
         # Set relevant global attributes to the entire study
         self.__db_url = db_url
@@ -106,6 +107,7 @@ class NeuralTrainerBase(ABC):
         self.__debug_mode = debug_mode
         self.__model_class = model
         self.__optimizer_class = optimizer
+        self.__output_mapping = output_mapping
 
         # Create output directory if it doesn't exist
         self.__output_dir.mkdir(parents=True, exist_ok=True)
@@ -167,8 +169,12 @@ class NeuralTrainerBase(ABC):
             logging_level = logging.INFO
 
         # Setting up the logger
-        self.logger = logging.getLogger("NeuralTrainBase")
-        self.logger.setLevel(logging_level)
+        logger = logging.getLogger("NeuralTrainBase")
+        logger.setLevel(logging_level)
+
+        # Remove any existing handlers to avoid duplicates
+        if logger.hasHandlers():
+            logger.handlers.clear()
 
         # Setting up the formatter for structured logging
         formatter = logging.Formatter(
@@ -176,7 +182,10 @@ class NeuralTrainerBase(ABC):
         )
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
+        logger.addHandler(console_handler)
+        logger.propagate = False
+
+        self.logger = logger
 
         self.logger.debug(f"Logger initialized for study '{self.__study_id}'.")
 
@@ -193,14 +202,18 @@ class NeuralTrainerBase(ABC):
         level = logging.DEBUG if self.__debug_mode else logging.INFO
         logger.setLevel(level)
 
-        if not logger.handlers:
-            formatter = logging.Formatter(
-                f"[%(asctime)s] [RUN {run.number}] [%(levelname)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S"
-            )
-            handler = logging.StreamHandler()
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
+        # Remove any existing handlers to avoid duplicates
+        if logger.hasHandlers():
+            logger.handlers.clear()
+
+        formatter = logging.Formatter(
+            f"[%(asctime)s] [RUN {run.number}] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.propagate = False
 
         self.logger = logger
 
@@ -591,13 +604,19 @@ class NeuralTrainerBase(ABC):
         mae_metric = MeanAbsoluteError().to(device)
         mse_metric = MeanSquaredError().to(device)
 
-        # New: Denormalized metrics
-        mae_real_metric = MeanAbsoluteError().to(device)
-        mse_real_metric = MeanSquaredError().to(device)
-
         # Initialize loss variables
         total_loss = 0.0
         total_samples = 0
+
+        # Per-output metrics
+        per_output_mae = {
+            name: MeanAbsoluteError().to(device)
+            for name in self.__output_mapping
+        }
+        per_output_mse = {
+            name: MeanSquaredError().to(device)
+            for name in self.__output_mapping
+        }
 
         model.train()
 
@@ -624,18 +643,29 @@ class NeuralTrainerBase(ABC):
             outputs_real = self.denormalize(outputs)
             targets_real = self.denormalize(targets)
 
-            # Real updates
-            mae_real_metric.update(outputs_real, targets_real)
-            mse_real_metric.update(outputs_real, targets_real)
+            # Per-variable denormalized metrics
+            if outputs_real.shape[1] != len(self.__output_mapping):
+                raise ValueError(
+                    f"Mismatch between number of outputs ({outputs_real.shape[1]}) "
+                    f"and output_mapping ({len(self.__output_mapping)} entries)."
+                )
+            for i, name in enumerate(self.__output_mapping):
+                per_output_mae[name].update(outputs_real[:, i], targets_real[:, i])
+                per_output_mse[name].update(outputs_real[:, i], targets_real[:, i])
 
-        return {
+        # Final aggregation
+        metrics = {
             "train/loss": total_loss / total_samples,
             "train/mse": mse_metric.compute().item(),
             "train/mae": mae_metric.compute().item(),
             "train/r2": r2_metric.compute().item(),
-            "train/mse_real": mse_real_metric.compute().item(),
-            "train/mae_real": mae_real_metric.compute().item(),
         }
+
+        for name in self.__output_mapping:
+            metrics[f"train/{name}_mae"] = per_output_mae[name].compute().item()
+            metrics[f"train/{name}_mse"] = per_output_mse[name].compute().item()
+
+        return metrics
 
     def evaluate(self, model: torch.nn.Module, loss_fn: _Loss, test_dl: DataLoader, device: torch.device) -> dict:
         # Normalized metrics
@@ -643,13 +673,19 @@ class NeuralTrainerBase(ABC):
         mae_metric = MeanAbsoluteError().to(device)
         mse_metric = MeanSquaredError().to(device)
 
-        # Denormalized metrics
-        mae_real_metric = MeanAbsoluteError().to(device)
-        mse_real_metric = MeanSquaredError().to(device)
-
         # Initialize loss variables
         total_loss = 0.0
         total_samples = 0
+
+        # Per-output metrics
+        per_output_mae = {
+            name: MeanAbsoluteError().to(device)
+            for name in self.__output_mapping
+        }
+        per_output_mse = {
+            name: MeanSquaredError().to(device)
+            for name in self.__output_mapping
+        }
 
         model.eval()
         with torch.no_grad():
@@ -674,18 +710,29 @@ class NeuralTrainerBase(ABC):
                 outputs_real = self.denormalize(outputs)
                 targets_real = self.denormalize(targets)
 
-                # Update real metrics
-                mae_real_metric.update(outputs_real, targets_real)
-                mse_real_metric.update(outputs_real, targets_real)
+                # Per-variable denormalized metrics
+                if outputs_real.shape[1] != len(self.__output_mapping):
+                    raise ValueError(
+                        f"Mismatch between number of outputs ({outputs_real.shape[1]}) "
+                        f"and output_mapping ({len(self.__output_mapping)} entries)."
+                    )
+                for i, name in enumerate(self.__output_mapping):
+                    per_output_mae[name].update(outputs_real[:, i], targets_real[:, i])
+                    per_output_mse[name].update(outputs_real[:, i], targets_real[:, i])
 
-        return {
+        # Final aggregation
+        metrics = {
             "evaluate/loss": total_loss / total_samples,
             "evaluate/mse": mse_metric.compute().item(),
             "evaluate/mae": mae_metric.compute().item(),
             "evaluate/r2": r2_metric.compute().item(),
-            "evaluate/mse_real": mse_real_metric.compute().item(),
-            "evaluate/mae_real": mae_real_metric.compute().item(),
         }
+
+        for name in self.__output_mapping:
+            metrics[f"evaluate/{name}_mae"] = per_output_mae[name].compute().item()
+            metrics[f"evaluate/{name}_mse"] = per_output_mse[name].compute().item()
+
+        return metrics
 
     def objective(
         self, 

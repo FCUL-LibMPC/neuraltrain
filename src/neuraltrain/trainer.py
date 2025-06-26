@@ -1,39 +1,55 @@
-import optuna
 import sys
-import multiprocessing
-from abc import ABC, abstractmethod
-from typing import List
-from optuna.study import MaxTrialsCallback
-from pathlib import Path
-import pickle
-import sqlite3
-import tempfile
-from typing import List, Dict, Any
-import logging
 import torch
-from .dataloaders import TimeSeriesDataset, DataLoader, Dataset
-from torchmetrics.regression import MeanAbsoluteError, R2Score, MeanSquaredError
-import pandas as pd
 import wandb
-from typing import Type, List
-from enum import Enum
-from torch.nn import Module
-from torch.optim import Optimizer
-from torch.nn.modules.loss import _Loss
+import pickle
+import optuna
+import sqlite3
+import logging
+import tempfile
+import multiprocessing
+from typing import List
+from pathlib import Path
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
+from optuna.study import MaxTrialsCallback
+from typing import List, Dict, Any, Tuple, Type
 
-@dataclass
-class RunConfig:
-    hidden_dims: List[int]
-    batch_size: int
-    epochs: int
-    train_proportion: float
-    learning_rate: float
-    weight_decay: float
+
+# Type aliases for search space and configurations
+HyperParameter = Tuple[Tuple[int, int], int, int, float, float, float]
+SearchSpace = List[HyperParameter]
+ModelType = Type[torch.nn.Module]
+OptimizerType = Type[torch.optim.Optimizer]
+
+# Dataclass configurations for study and model
+@dataclass(frozen=True)
+class StudyConfig:
+    sqlite_url: str
+    """SQLite3 database URL for storing study results."""
+    study_id: str
+    """Unique identifier for the study, used to group results and to identify logs in Weights&Biases."""
+    search_space: SearchSpace
+    """Cartesian product of hyperparameter combinations.
+    Each tuple is:
+    ((hidden_dim_1, hidden_dim_2, ...), batch_size, epochs, learning_rate, weight_decay, train_proportion)
+    """
+    output_dir: Path
+    """Path to the directory in which the results and local logs will be stored."""
+    debug_mode: bool = False
+    """If True, enables debug logging and additional checks."""
+
+@dataclass(frozen=True)
+class ModelConfig:
+    model_class: ModelType
+    """Class of the ANN model to be trained. Must be a subclass of `torch.nn.Module`."""
+    optimizer_class: OptimizerType
+    """Class of the optimizer to be used for training. Must be a subclass of `torch.optim.Optimizer`."""
     input_dim: int
+    """Dimension of the input laye, equivalent to the size of the model input array."""
     output_dim: int
+    """Dimension of the output layer, equivalent to the size of the model output array."""
 
-@dataclass
+@dataclass(frozen=True)
 class RunState:
     # Paths and IDs
     checkpoint_path: Path
@@ -63,13 +79,35 @@ class RunState:
     wandb_id: str
     wandb_name: str
 
+    def to_database_dict(self) -> Dict[str, Any]:
+        """
+        Extracts the run-relevant training information from the RunState to store in the Optuna database.
+        Remaining information is not relevant for the database as it is stored in the checkpoint.
+
+        ### Returns:
+        - dict: A dictionary containing run-relevant training information for the Optuna database.
+        """
+        return {
+            "checkpoint_path": str(self.checkpoint_path),
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "hidden_dims": self.hidden_dims,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "train_proportion": self.train_proportion,
+            "batch_size": self.batch_size,
+            "epochs": self.epochs,
+            "wandb_id": self.wandb_id,
+            "wandb_name": self.wandb_name
+        }
+
     def to_checkpoint_dict(self) -> Dict[str, Any]:
         """
         Extracts the checkpoint-relevant training state from the RunState to store as pickled dictionary.
         Remaining information is not relevant for checkpointing as it is stored in the database.
 
-        Returns:
-            dict: A dictionary containing runtime training state for checkpointing.
+        ### Returns:
+        - dict: A dictionary containing runtime training state for checkpointing.
         """
         return {
             "epoch": self.epoch,
@@ -83,40 +121,46 @@ class NoCheckpointAvailable(Exception):
     """Raised when no checkpoint is configured or found for a trial."""
     pass
 
-class NeuralTrainerBase(ABC):
-    """Abstract class to implement a Neural Network training levaraging Optuna for optimization and paralelism."""
+class NeuralNetworkTrainFramework(ABC):
+    """
+    Abstract base class that provides a structured framework for training neural network models with support for
+    reproducible experiment management, including checkpointing, resuming trials, logging (e.g., via Weights & Biases),
+    and parallel execution using Optuna.
 
-    def __init__(
-        self,
-        db_url: str,
-        study_id: str,
-        n_runs: int,
-        output_dir: str,
-        model: Type[Module],
-        optimizer: Type[Optimizer],
-        output_mapping: List[str],
-        sampler=None,
-        pruner=None,
-        debug_mode=False,
-    ):
-        # Set relevant global attributes to the entire study
-        self.__db_url = db_url
-        self.__study_id = study_id
-        self.__n_runs = n_runs
-        self.__output_dir = Path(output_dir) / f"{self.__study_id}"
-        self.__debug_mode = debug_mode
-        self.__model_class = model
-        self.__optimizer_class = optimizer
-        self.__output_mapping = output_mapping
+    This class is not responsible for implementing the actual model training or evaluation logic. Instead, it defines
+    the infrastructure and lifecycle for a training experiment, while delegating the training and evaluation routines
+    to subclasses via abstract methods.
+    """
 
-        # Create output directory if it doesn't exist
-        self.__output_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, study_config: StudyConfig, model_config: ModelConfig):
+        """
+        Initializes the training framework with the provided study and model configurations.
 
-        # Modified by distributed_run in case of multiple processes
-        self.__n_processes = 1                  
+        ### Args:
+        - study_config (StudyConfig): Configuration for the study, including database URL, study ID, number of runs, and output directory.
+        - model_config (ModelConfig): Configuration for the model, including model class, optimizer class, input dimension, and output dimension.
+        """
+
+        # Study information
+        self._sqlite_url = study_config.sqlite_url
+        self._study_id = study_config.study_id
+        self._search_space = study_config.search_space
+        self._num_runs = len(self._search_space)
+        self._output_dir = study_config.output_dir / f"{self._study_id}"
+        self._num_processes = 1  # Default to single process; Can be overridden later at self.distributed_run()
+        self._debug_mode = study_config.debug_mode
+
+        # Model information
+        self._model_class = model_config.model_class
+        self._optimizer_class = model_config.optimizer_class
+        self._input_dim = model_config.input_dim
+        self._output_dim = model_config.output_dim
+
+        # Make sure the output directory exists
+        self._output_dir.mkdir(parents=True, exist_ok=True)
 
         # Setup the logger
-        self.__init_logger(self.__debug_mode)
+        self.__init_logger()
 
         # Check and recover from previously failed/incomplete study
         all_runs = self.__get_all_runs()
@@ -126,7 +170,7 @@ class NeuralTrainerBase(ABC):
                 run for run in all_runs if run["state"] == "COMPLETE"
             ]
             self.logger.debug(
-                f"Found {len(completed_runs)} COMPLETED run(s) in study '{self.__study_id}'."
+                f"Found {len(completed_runs)} COMPLETED run(s) in study '{self._study_id}'."
             )
 
             # Get failed runs
@@ -134,16 +178,16 @@ class NeuralTrainerBase(ABC):
                 run for run in all_runs if run["state"] in ["FAIL", "RUNNING"]
             ]
             self.logger.debug(
-                f"Found {len(failed_runs)} FAIL/RUNNING run(s) in study '{self.__study_id}'."
+                f"Found {len(failed_runs)} FAIL/RUNNING run(s) in study '{self._study_id}'."
             )
 
             # Recover study from failed state; Subtract completed runs from n_runs
-            self.__n_runs -= len(completed_runs)
+            self._num_runs -= len(completed_runs)
 
             # Re-enqueue failed runs
             if failed_runs:
                 self.logger.warning(
-                    f"Re-enqueuing {len(failed_runs)} failed run(s) in study '{self.__study_id}'."
+                    f"Re-enqueuing {len(failed_runs)} failed run(s) in study '{self._study_id}'."
                 )
                 self.__reenqueue_failed_trials(
                     [run["trial_id"] for run in failed_runs]
@@ -151,26 +195,26 @@ class NeuralTrainerBase(ABC):
 
         # Create a new study or load an existing one
         self.study = optuna.create_study(
-            storage=self.__db_url,
-            study_name=self.__study_id,
+            storage=self._sqlite_url,
+            study_name=self._study_id,
             direction="minimize",
-            sampler=sampler,
-            pruner=pruner,
             load_if_exists=True,
         )
 
-        self.logger.info(f"Study '{self.__study_id}' initialized successfully.")
+        if self._num_runs == 0:
+            return self.logger.warning(
+                f"All runs in study '{self._study_id}' are already completed. No new runs will be started."
+            )
 
-    def __init_logger(self, debug_mode: bool = False):
-        # Setting the log level based on debug mode
-        if debug_mode:
-            logging_level = logging.DEBUG
-        else:
-            logging_level = logging.INFO
+        self.logger.info(f"Study '{self._study_id}' initialized successfully.")
 
+    # Logger related initialization methods
+    def __init_logger(self) -> None:
+        """Initializes the logger for the training framework."""
         # Setting up the logger
-        logger = logging.getLogger("NeuralTrainBase")
-        logger.setLevel(logging_level)
+        logger = logging.getLogger(self.__class__.__name__)
+        level = logging.DEBUG if self._debug_mode else logging.INFO
+        logger.setLevel(level)
 
         # Remove any existing handlers to avoid duplicates
         if logger.hasHandlers():
@@ -186,20 +230,19 @@ class NeuralTrainerBase(ABC):
         logger.propagate = False
 
         self.logger = logger
+        logger.info(f"Logger initialized for {self.__class__.__name__}")
 
-        self.logger.debug(f"Logger initialized for study '{self.__study_id}'.")
-
-    def __init_run_logger(self, run: optuna.Trial):
+    def __init_run_logger(self, run: optuna.Trial) -> None:
         """
         Initializes a per-run logger with the run number included in the log format.
 
         Args:
             run_number (int): The Optuna trial number for this run.
         """
-        logger_name = f"NeuralTrainBase.Run{run.number}"
+        logger_name = f"{self.__class__.__name__}.Run{run.number}"
         logger = logging.getLogger(logger_name)
 
-        level = logging.DEBUG if self.__debug_mode else logging.INFO
+        level = logging.DEBUG if self._debug_mode else logging.INFO
         logger.setLevel(level)
 
         # Remove any existing handlers to avoid duplicates
@@ -216,7 +259,9 @@ class NeuralTrainerBase(ABC):
         logger.propagate = False
 
         self.logger = logger
+        logger.info(f"Logger initialized for '{logger_name}'.")
 
+    # Study initialization and recovery methods
     def __reenqueue_failed_trials(self, trial_ids: List[int]) -> None:
         """Manually re-enqueues failed trials back to WAITING state in the Optuna SQLite database.
 
@@ -228,7 +273,7 @@ class NeuralTrainerBase(ABC):
             return
 
         # Extract the database path from the URL
-        db_path = self.__db_url.replace("sqlite:///", "")
+        db_path = self._sqlite_url.replace("sqlite:///", "")
 
         # Check if the database file exists
         if not Path(db_path).exists():
@@ -259,14 +304,14 @@ class NeuralTrainerBase(ABC):
         conn.close()
 
         self.logger.warning(
-            f"Re-enqueued {affected_rows} failed trial(s) in study '{self.__study_id}'."
+            f"Re-enqueued {affected_rows} failed trial(s) in study '{self._study_id}'."
         )
 
     def __get_all_runs(self) -> List[Dict[str, Any]]:
         """Retrieves all trials from the Optuna SQLite database for the current study."""
 
         # Extract SQLite database path from the url
-        db_path = self.__db_url.removeprefix("sqlite:///")
+        db_path = self._sqlite_url.removeprefix("sqlite:///")
 
         # Check if database already exists, if not return an empty list
         if not Path(db_path).exists():
@@ -282,14 +327,14 @@ class NeuralTrainerBase(ABC):
 
         # Retrieve the study_id
         result = cursor.execute(
-            "SELECT study_id FROM studies WHERE study_name = ?", (self.study_id,)
+            "SELECT study_id FROM studies WHERE study_name = ?", (self._study_id,)
         ).fetchone()
 
         # Check if the study exists
         if result is None:
             conn.close()
             self.logger.warning(
-                f"Study '{self.__study_id}' not found in database. Expected if it is the first time."
+                f"Study '{self._study_id}' not found in database. Expected if it is the first time."
             )
             return []
         study_id = result[0]
@@ -312,7 +357,7 @@ class NeuralTrainerBase(ABC):
         # Convert trial data into a list of dictionaries
         trials_list = [dict(trial) for trial in trials]
         self.logger.debug(f"Retrieved {len(trials)} trials from the database.")
-        if self.__debug_mode and trials_list:
+        if self._debug_mode and trials_list:
             for trial in trials_list:
                 self.logger.debug(trial)
         return trials_list
@@ -342,6 +387,46 @@ class NeuralTrainerBase(ABC):
             self.logger.error(f"Pickle Error: {e}")
             return {}
 
+    def __check_run_config(self, hl, bs, ep, lr, wd, t_proportion) -> HyperParameter:
+        """Raise descriptive error for invalid values ir configuration."""
+
+        # Check train proportion
+        if not 0.0 < t_proportion < 1.0:
+            raise ValueError(
+                f"Invalid train_proportion: {t_proportion}. Must be between 0 and 1 (exclusive)."
+            )
+        
+        # Check batchsize value
+        if not isinstance(bs, int) or bs <= 0:
+            raise ValueError(f"Invalid batch_size: {bs}. Must be a positive integer.")
+        
+        # Check hidden layer sizes
+        if isinstance(hl, (tuple, list)):
+            if not all(isinstance(h, int) and h > 0 for h in hl):
+                raise ValueError(
+                    f"Invalid hidden layer dimensions: {hl}."
+                )
+        else:
+            if not isinstance(hl, int) or hl <= 0:
+                raise ValueError(
+                    f"Invalid hidden layer dimension: {hl}. Must be a positive integer."
+                )
+        
+        # Check learning rate value
+        if not (0 < lr < 1):
+            raise ValueError(f"Learning rate too high or invalid: {lr}.")
+
+        # Check weight decay value
+        if not (0 <= wd < 1):
+            raise ValueError(f"Weight decay invalid: {wd}. Must be >= 0 and < 1.")
+        
+        # Check epochs value
+        if not isinstance(ep, int) or ep <= 0:
+            raise ValueError(f"Invalid epochs: {ep}. Must be a positive integer.")
+        
+        return hl, bs, ep, lr, wd, t_proportion
+
+    # Checkpoint and run state management methods
     def __try_resume_from_checkpoint(self, run: optuna.Trial, device: torch.device) -> RunState:
         """
         Attempt to resume training from a previously saved checkpoint based on the run's user attributes.
@@ -349,8 +434,7 @@ class NeuralTrainerBase(ABC):
         Raises:
             NoCheckpointAvailable: If no checkpoint information is found for the given trial.
             Exception: Possibly related to incomplete/corrupted checkpoints (e.g. KeyError for missing entries in attrs or checkpoint).
-        """
-        
+        """        
         # Check if the run has an existing checkpoint
         if not run.user_attrs or "checkpoint_path" not in run.user_attrs or not Path(run.user_attrs["checkpoint_path"]).exists():
             raise NoCheckpointAvailable(f"No checkpoint found.")
@@ -410,89 +494,47 @@ class NeuralTrainerBase(ABC):
             wandb_name=wandb_name,
         )
 
-    def __check_run_config(self, config: RunConfig) -> None:
-        """Raise descriptive error for invalid values ir configuration."""
+    def __load_or_initialize_run(self, run: optuna.Trial, device: torch.device) -> RunState:
+        try:
+            state: RunState = self.__try_resume_from_checkpoint(run, device)
+            self.logger.info(f"Resumed from checkpoint at epoch {state.epoch}")
+        except NoCheckpointAvailable:
+            # Initialize the run config from scratch (hyperparameters)
+            hyperparameters = self.prepare_hyperparameters(run, device)
+            hl, bs, ep, lr, wd, t_proportion = self.__check_run_config(*hyperparameters)
+            
+            # Build checkpoints folder path if does not exist
+            checkpoint_dir = Path(self._output_dir) / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check train proportion
-        tp = config.train_proportion
-        if not 0.0 < tp < 1.0:
-            raise ValueError(
-                f"Invalid train_proportion: {tp}. Must be between 0 and 1 (exclusive)."
+            # Initialize the run state from scratch
+            state = RunState(
+                checkpoint_path=checkpoint_dir / f"{self.study_id}_{run.number}.pkl",
+                input_dim=self._input_dim,
+                output_dim=self._output_dim,
+                hidden_dims=hl,
+                learning_rate=lr,
+                weight_decay=wd,
+                train_proportion=t_proportion,
+                batch_size=bs,
+                epochs=ep,
+                epoch=0,
+                best_model_loss=float("inf"),
+                best_model_state_dict={},
+                model_state_dict={},
+                optimizer_state_dict={},
+                wandb_id=f"{self.study_id}_{run.number}",
+                wandb_name=f"run_{run.number}_bs{bs}_hl{'x'.join(map(str, hl))}",
             )
-        
-        # Check batchsize value
-        bs = config.batch_size
-        if not isinstance(bs, int) or bs <= 0:
-            raise ValueError(f"Invalid batch_size: {bs}. Must be a positive integer.")
-        
-        # Check hidden layer sizes
-        hls = config.hidden_dims
-        if isinstance(hls, (tuple, list)):
-            if not all(isinstance(h, int) and h > 0 for h in hls):
-                raise ValueError(
-                    f"Invalid hidden layer dimensions: {hls}."
-                )
-        else:
-            if not isinstance(hls, int) or hls <= 0:
-                raise ValueError(
-                    f"Invalid hidden layer dimension: {hls}. Must be a positive integer."
-                )
-        
-        # Check learning rate value
-        lr = config.learning_rate
-        if not (0 < lr < 1):
-            raise ValueError(f"Learning rate too high or invalid: {lr}.")
 
-        # Check weight decay value
-        wd = config.weight_decay
-        if not (0 <= wd < 1):
-            raise ValueError(f"Weight decay invalid: {wd}. Must be >= 0 and < 1.")
-
-    def __initialize_from_scratch(self, run: optuna.Trial, device: torch.device) -> RunState:
-        """
-        Initializes a new RunState from scratch for a fresh Optuna trial.
-
-        Args:
-            run (optuna.Trial): The current run.
-            device (torch.device): The target device for model initialization.
-
-        Returns:
-            RunState: A fully initialized run state ready for training.
-        """
-
-        self.logger.info(f"Initializing state from scratch.")
-        
-        # Generate hyperparameters
-        self.logger.debug(f"Getting run hyperparameters.")
-        config: RunConfig = self.setup_run(run)
-
-        # Validate the parameters (optional safety)
-        self.logger.debug(f"Checking generated hyperparameters.")
-        self.__check_run_config(config)
-
-        # Build checkpoints folder path if does not exist
-        checkpoint_dir = Path(self.__output_dir) / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create RunState
-        return RunState(
-            checkpoint_path=checkpoint_dir / f"{self.study_id}_{run.number}.pkl",
-            input_dim=config.input_dim,
-            output_dim=config.output_dim,
-            hidden_dims=config.hidden_dims,
-            learning_rate=config.learning_rate,
-            weight_decay=config.weight_decay,
-            train_proportion=config.train_proportion,
-            batch_size=config.batch_size,
-            epochs=config.epochs,
-            epoch=0,
-            best_model_loss=float("inf"),
-            best_model_state_dict={},
-            model_state_dict={},
-            optimizer_state_dict={},
-            wandb_id=f"{self.study_id}_{run.number}",
-            wandb_name=f"run_{run.number}_bs{config.batch_size}_hl{'x'.join(map(str, config.hidden_dims))}",
-        )
+            # Store run information in the optuna database attributes
+            for k, v in state.to_database_dict().items():
+                run.set_user_attr(k, str(v) if isinstance(v, Path) else v)
+        except (KeyError, RuntimeError, ValueError) as e:
+            # Crash early to avoid proceeding with invalid state
+            self.logger.error(f"Checkpoint is corrupted or incomplete: {e}")
+            raise
+        return state
 
     def __create_checkpoint(self, run: optuna.Trial, checkpoint_path: Path, state: dict) -> None:
         """Atomically saves a checkpoint by writing to a temp file first, then replacing the original.
@@ -538,13 +580,12 @@ class NeuralTrainerBase(ABC):
         Args:
             *args: Additional arguments to pass to the objective function.
         """
-
         self.study.optimize(
-            lambda trial: self.objective(trial, *args),
-            n_trials=self.__n_runs,
+            lambda trial: self.__run_trial(trial, *args),
+            n_trials=self._num_runs,
             callbacks=[
                 MaxTrialsCallback(  # This callback will stop the study once the number of trials is reached
-                    self.__n_runs, states=(optuna.trial.TrialState.COMPLETE,)
+                    self._num_runs, states=(optuna.trial.TrialState.COMPLETE,)
                 )
             ],
         )
@@ -565,28 +606,29 @@ class NeuralTrainerBase(ABC):
         """
 
         # Update the number of processes
-        self.__n_processes = n_processes
+        self._num_processes = n_processes
 
         # Check if n_processes if higher than 0
-        if self.__n_processes <= 0:
+        if self._num_processes <= 0:
             raise RuntimeError(
                 "Specified number of processes must be equal or greater than 1."
             )
 
         # Check if n_processes is equal to 1
-        if self.__n_processes == 1:
+        if self._num_processes == 1:
             self.logger.debug("Running in single-process mode.")
             self.run(*args)
             return
 
         # Initialize processes
         processes: List[multiprocessing.Process] = []
-        multiprocessing.set_start_method("spawn", force=True)
+        if multiprocessing.get_start_method(allow_none=True) != "spawn":
+            multiprocessing.set_start_method("spawn", force=True)
 
-        self.logger.info(f"Spawning {self.__n_processes} parallel processes.")
+        self.logger.info(f"Spawning {self._num_processes} parallel processes.")
 
         # Start processes
-        for _ in range(self.__n_processes):
+        for _ in range(self._num_processes):
             p = multiprocessing.Process(target=self.run, args=args)
             processes.append(p)
             p.start()
@@ -597,150 +639,7 @@ class NeuralTrainerBase(ABC):
             p.join()
             self.logger.debug(f"Process {p.pid} finished.")
 
-    # Main training methods
-    def train(self, model: Module, loss_fn: _Loss, train_dl: DataLoader, optimizer: Optimizer, device: torch.device) -> dict:
-        # Normalized metrics
-        r2_metric = R2Score().to(device)
-        mae_metric = MeanAbsoluteError().to(device)
-        mse_metric = MeanSquaredError().to(device)
-
-        # Initialize loss variables
-        total_loss = 0.0
-        total_samples = 0
-
-        # Per-output metrics
-        per_output_mae = {
-            name: MeanAbsoluteError().to(device)
-            for name in self.__output_mapping
-        }
-        per_output_mse = {
-            name: MeanSquaredError().to(device)
-            for name in self.__output_mapping
-        }
-
-        model.train()
-
-        for inputs, targets in train_dl:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-
-            loss = loss_fn(outputs, targets)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # Accumulate weighted loss
-            batch_size = targets.size(0)
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
-
-            # Normalized updates
-            r2_metric.update(outputs, targets)
-            mae_metric.update(outputs, targets)
-            mse_metric.update(outputs, targets)
-
-            # Desnormalize (assumindo radiação entre 0 e 1000)
-            outputs_real = self.denormalize(outputs)
-            targets_real = self.denormalize(targets)
-
-            # Per-variable denormalized metrics
-            if outputs_real.shape[1] != len(self.__output_mapping):
-                raise ValueError(
-                    f"Mismatch between number of outputs ({outputs_real.shape[1]}) "
-                    f"and output_mapping ({len(self.__output_mapping)} entries)."
-                )
-            for i, name in enumerate(self.__output_mapping):
-                per_output_mae[name].update(outputs_real[:, i], targets_real[:, i])
-                per_output_mse[name].update(outputs_real[:, i], targets_real[:, i])
-
-        # Final aggregation
-        metrics = {
-            "train/loss": total_loss / total_samples,
-            "train/mse": mse_metric.compute().item(),
-            "train/mae": mae_metric.compute().item(),
-            "train/r2": r2_metric.compute().item(),
-        }
-
-        for name in self.__output_mapping:
-            metrics[f"train/{name}_mae"] = per_output_mae[name].compute().item()
-            metrics[f"train/{name}_mse"] = per_output_mse[name].compute().item()
-
-        return metrics
-
-    def evaluate(self, model: torch.nn.Module, loss_fn: _Loss, test_dl: DataLoader, device: torch.device) -> dict:
-        # Normalized metrics
-        r2_metric = R2Score().to(device)
-        mae_metric = MeanAbsoluteError().to(device)
-        mse_metric = MeanSquaredError().to(device)
-
-        # Initialize loss variables
-        total_loss = 0.0
-        total_samples = 0
-
-        # Per-output metrics
-        per_output_mae = {
-            name: MeanAbsoluteError().to(device)
-            for name in self.__output_mapping
-        }
-        per_output_mse = {
-            name: MeanSquaredError().to(device)
-            for name in self.__output_mapping
-        }
-
-        model.eval()
-        with torch.no_grad():
-            for inputs, targets in test_dl:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-
-                # Compute loss
-                loss = loss_fn(outputs, targets)
-
-                # Accumulate weighted loss
-                batch_size = targets.size(0)
-                total_loss += loss.item() * batch_size
-                total_samples += batch_size
-
-                # Update normalized metrics
-                r2_metric.update(outputs, targets)
-                mae_metric.update(outputs, targets)
-                mse_metric.update(outputs, targets)
-
-                # Denormalize outputs and targets
-                outputs_real = self.denormalize(outputs)
-                targets_real = self.denormalize(targets)
-
-                # Per-variable denormalized metrics
-                if outputs_real.shape[1] != len(self.__output_mapping):
-                    raise ValueError(
-                        f"Mismatch between number of outputs ({outputs_real.shape[1]}) "
-                        f"and output_mapping ({len(self.__output_mapping)} entries)."
-                    )
-                for i, name in enumerate(self.__output_mapping):
-                    per_output_mae[name].update(outputs_real[:, i], targets_real[:, i])
-                    per_output_mse[name].update(outputs_real[:, i], targets_real[:, i])
-
-        # Final aggregation
-        metrics = {
-            "evaluate/loss": total_loss / total_samples,
-            "evaluate/mse": mse_metric.compute().item(),
-            "evaluate/mae": mae_metric.compute().item(),
-            "evaluate/r2": r2_metric.compute().item(),
-        }
-
-        for name in self.__output_mapping:
-            metrics[f"evaluate/{name}_mae"] = per_output_mae[name].compute().item()
-            metrics[f"evaluate/{name}_mse"] = per_output_mse[name].compute().item()
-
-        return metrics
-
-    def objective(
-        self, 
-        run: optuna.Trial,
-        data_path: str
-    ) -> float:
-        """Objective function to optimize. To be implemented in child classes."""
-        
+    def __run_trial(self, run: optuna.Trial, *args) -> float:
         # Initialize the run logger
         self.__init_run_logger(run)
 
@@ -748,36 +647,16 @@ class NeuralTrainerBase(ABC):
         if torch.cuda.is_available():
             device_index = run.number % torch.cuda.device_count()
             device = torch.device(f"cuda:{device_index}")
-            self.logger.info(f"Using '{torch.cuda.device_count()}' CUDA devices.")
+            self.logger.info(f"Using '{device}' CUDA device.")
         else:
             device = torch.device("cpu")
             self.logger.info(f"Using CPU.")
 
         # Resume or initialize the run state
-        try:
-            state = self.__try_resume_from_checkpoint(run, device)
-            self.logger.info(f"Resuming run from checkpoint at epoch {state.epoch}.")
-        except NoCheckpointAvailable:
-            # Initialize the state for the  run, from scratch
-            self.logger.debug(f"No checkpoint found for run {run.number}.")
-            state = self.__initialize_from_scratch(run, device)
+        state = self.__load_or_initialize_run(run, device)
 
-            # Storing run information in Optuna database
-            run.set_user_attr("checkpoint_path", str(state.checkpoint_path))
-            run.set_user_attr("batch_size", state.batch_size)
-            run.set_user_attr("learning_rate", state.learning_rate)
-            run.set_user_attr("weight_decay", state.weight_decay)
-            run.set_user_attr("train_proportion", state.train_proportion)
-            run.set_user_attr("epochs", state.epochs)
-            run.set_user_attr("input_dim", state.input_dim)
-            run.set_user_attr("output_dim", state.output_dim)
-            run.set_user_attr("hidden_dims", state.hidden_dims)
-            run.set_user_attr("wandb_id", state.wandb_id)
-            run.set_user_attr("wandb_name", state.wandb_name) 
-        except (KeyError, RuntimeError, ValueError) as e:
-            # Crash early to avoid proceeding with invalid state
-            self.logger.error(f"Checkpoint is corrupted or incomplete: {e}")
-            raise
+        # Call prepare_run if it exists in the subclass
+        self.prepare_run(run, state, device)
 
         # Initialize WandB run | REFERENCE FOR DISTRIBUTED: https://docs.wandb.ai/support/multiprocessing_eg_distributed_training/
         wandb_run = wandb.init(
@@ -786,36 +665,31 @@ class NeuralTrainerBase(ABC):
             name=state.wandb_name,
             group="neuraltrain",
             config={
-                "input_dim": state.input_dim,
+                "input_dim": self._input_dim,
                 "output_dim": state.output_dim,
                 "hidden_dims": state.hidden_dims,
                 "batch_size": state.batch_size,
                 "train_portion": state.train_proportion,
-                "evaluation_portion": round(1 - state.train_proportion),
                 "learning_rate": state.learning_rate,
                 "weight_decay": state.weight_decay,
             },
             reinit=True,
-            dir=self.__output_dir,
+            dir=self._output_dir,
         )
 
-        input_dim = state.input_dim
-        hidden_dims = state.hidden_dims
-        output_dim = state.output_dim
-
-        self.logger.debug(f"Initializing model with input_dim: {input_dim}, hidden_dims: {hidden_dims}, output_dim: {output_dim}.")
         # Instantiate model and load state if available
-        model = self.__model_class(
-            input_dim, 
-            hidden_dims, 
-            output_dim
+        self.logger.debug(f"Initializing model with input_dim: {self._input_dim}, hidden_dims: {state.hidden_dims}, output_dim: {self._input_dim}.")
+        model = self._model_class(
+            self._input_dim, 
+            state.hidden_dims, 
+            self._output_dim
         ).to(device)
         if state.model_state_dict:
             model.load_state_dict(state.model_state_dict)
 
-        self.logger.debug(f"Initializing optimizer with learning_rate: {state.learning_rate}, weight_decay: {state.weight_decay}.")
         # Instantiate optimizer and load state if available
-        optimizer: Optimizer = self.__optimizer_class(
+        self.logger.debug(f"Initializing optimizer with learning_rate: {state.learning_rate}, weight_decay: {state.weight_decay}.")
+        optimizer: torch.optim.Optimizer = self._optimizer_class(
             model.parameters(),
             lr=state.learning_rate,
             weight_decay=state.weight_decay,
@@ -823,34 +697,17 @@ class NeuralTrainerBase(ABC):
         if state.optimizer_state_dict:
             optimizer.load_state_dict(state.optimizer_state_dict)
 
-        # Load dataset and get dataloaders
-        df = pd.read_csv(data_path)
-        train_dl, test_dl = TimeSeriesDataset.get_dataloaders(
-            df,
-            input_col_filter=self.input_col_filter,
-            target_col_filter=self.target_col_filter,
-            train_proportion=state.train_proportion,
-            batch_size=state.batch_size,
-        )
-
-        input_cols = list(filter(self.input_col_filter, df.columns))
-        target_cols = list(filter(self.target_col_filter, df.columns))
-        self.logger.debug(f"Dataset input columns: {input_cols}")
-        self.logger.debug(f"Dataset target columns: {target_cols}")
-        self.logger.debug(f"Dataset loaded {len(df)} entries.")
-
-        loss_fn = self.loss_function()
-
         # NN training loop
         for epoch in range(state.epoch, state.epochs, 1):
             # Train the model for one epoch
             train_metrics = self.train(
-                model, loss_fn, train_dl, optimizer, device
+                model, optimizer, device
             )
-            eval_metrics = self.evaluate(model, loss_fn, test_dl, device)
+            eval_loss, eval_metrics = self.evaluate(model, device)
 
-            # Get the evaluation loss
-            eval_loss = eval_metrics["evaluate/loss"]
+            # Add prefixes to metrics keys (for separation in WandB)
+            train_metrics = {f"train/{k}": v for k, v in train_metrics.items()}
+            eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
 
             # Save the best model
             if eval_loss < state.best_model_loss:
@@ -863,7 +720,6 @@ class NeuralTrainerBase(ABC):
             # Log information
             wandb_run.log(
                 {
-                    "epoch": epoch + 1,
                     **train_metrics,
                     **eval_metrics,
                 },
@@ -885,7 +741,7 @@ class NeuralTrainerBase(ABC):
 
         # Store tracked best model
         model_path = (
-            Path(self.__output_dir) / f"{state.wandb_name}.pth"
+            Path(self._output_dir) / f"{state.wandb_name}_best_model.pth"
         )
         torch.save(state.best_model_state_dict, model_path)
 
@@ -894,8 +750,8 @@ class NeuralTrainerBase(ABC):
         self.logger.info(f" Best model saved at: {model_path}")
         self.logger.info(f" Best validation loss: {state.best_model_loss:.6f}")
         self.logger.info(f" Best model hyperparameters:")
-        self.logger.info(f"   • Input Dimension: {state.input_dim}")
-        self.logger.info(f"   • Output Dimension: {state.output_dim}")
+        self.logger.info(f"   • Input Dimension: {self._input_dim}")
+        self.logger.info(f"   • Output Dimension: {self._output_dim}")
         self.logger.info(f"   • Hidden Layers Sizes: {state.hidden_dims}")
         self.logger.info(f"   • Batch Size: {state.batch_size}")
         self.logger.info(f"   • Learning Rate: {state.learning_rate}")
@@ -907,104 +763,93 @@ class NeuralTrainerBase(ABC):
         wandb_run.finish()
         return state.best_model_loss
 
-    # To be implemented in child classes
-    @abstractmethod
-    def setup_run(self, run: optuna.Trial) -> RunConfig:
+    # Abstract methods to be implemented by subclasses
+    def prepare_hyperparameters(self, run: optuna.Trial, device: torch.device) -> HyperParameter:
         """
-        Generate and return a RunConfig object containing all resolved hyperparameters for a given Optuna trial.
+        Prepare the hyperparameters for the run based on the search space defined in the study.
+        This method can be overridden in subclasses to customize hyperparameter preparation (e.g. to include Optuna suggestions).
 
-        Each argument can be one of:
-        - A fixed value (e.g., `epochs=2000`) which will be used as-is.
-        - A list of options (e.g., `batch_size=[128, 256, 512]`), where one will be selected using `run.suggest_categorical`.
-        - A list of two values (e.g., `learning_rate=[1e-4, 1e-2]`), where a value will be sampled using `run.suggest_float`.
-
-        Args:
-            run (optuna.Trial): The Optuna trial object used to suggest values.
-
-        Returns:
-            RunConfig: A dataclass instance containing all resolved and ready-to-use hyperparameters:
-                - hidden_dims (List[int]): List of hidden layer sizes. 
-                  The length of the list is determined by the number of hidden layers in the specified model.
-                - batch_size (int): Training batch size.
-                - epochs (int): Number of training epochs.
-                - train_proportion (float): Proportion of dataset used for training (0 < value < 1).
-                - learning_rate (float): Learning rate for the optimizer.
-                - weight_decay (float): L2 regularization coefficient.
-                - input_dim (int): Input feature dimension (copied from argument).
-                - output_dim (int): Output feature dimension (copied from argument).
-                - wandb_id (str): Unique identifier for the W&B run.
-                - wandb_name (str): Human-readable name for the W&B run.
-                - checkpoint_path (str): Path to save the run checkpoint.
+        ### Args:
+        - run (optuna.Trial): The Optuna trial object used to suggest values.
+        - device (torch.device): The torch device where computations will take place.
         """
-        raise NotImplementedError("This method should be overridden in subclasses.")
+        return self.search_space[run.number]
+
+    def prepare_run(self, run: optuna.Trial, state: RunState, device: torch.device) -> None:
+        """
+        Method executed right after initialization and just before the training loop starts. Can be used for set up in subclasses.
+
+        ### Args:
+        - run (optuna.Trial): The Optuna trial object used to suggest values.
+        - state (RunState): The current run state containing hyperparameters and training progress.
+        - device (torch.device): The torch device where computations will take place.
+        """
+        pass
 
     @abstractmethod
-    def loss_function(self) -> _Loss:
+    def train(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> Dict[str, float]:
         """
-        Returns the loss function to be used in training and validation.
+        Train the model for one epoch and return training metrics.
 
-        This method must be implemented by subclasses to return an instance of a PyTorch
-        loss module suitable for regression tasks.
+        ### Args:
+        - model (torch.nn.Module): The neural network model to be trained.
+        - optimizer (torch.optim.Optimizer): The optimizer used for training the model.
+        - device (torch.device): The device on which the model is trained (CPU or GPU).
 
-        Examples of loss functions for regression in PyTorch include:
-            - torch.nn.MSELoss()           # Mean Squared Error Loss
-            - torch.nn.L1Loss()            # Mean Absolute Error (L1) Loss
-            - torch.nn.SmoothL1Loss()      # Huber loss, less sensitive to outliers
-            - torch.nn.HuberLoss()         # Same as SmoothL1Loss, more explicit name (PyTorch ≥1.10)
-            - torch.nn.PoissonNLLLoss()    # Poisson Negative Log-Likelihood Loss (for count data)
-
-        Implementation example:
-            return torch.nn.MSELoss()  
-
-        Returns:
-            torch.nn.modules.loss._Loss: A loss function instance compatible with PyTorch.
+        ### Returns:
+        - Dict[str, float]: A dictionary containing training metrics, such as MAE, MSE, R2, etc.
         """
-        raise NotImplementedError("This method should be overridden in subclasses.")
-
-    @abstractmethod
-    def input_col_filter(self, col: str) -> bool:
-        """Filter function to select input columns based on a condition."""
-        raise NotImplementedError("This method should be overridden in subclasses.")
-
-    @abstractmethod
-    def target_col_filter(self, col: str) -> bool:
-        """Filter function to select target columns based on a condition."""
         raise NotImplementedError("This method should be overridden in subclasses.")
     
     @abstractmethod
-    def denormalize(self, data: torch.Tensor) -> torch.Tensor:
-        """Denormalize the data to its original scale."""
+    def evaluate(self, model: torch.nn.Module, device: torch.device) -> Tuple[float, Dict[str, float]]:
+        """
+        Evaluate the model on the validation set and return evaluation metrics.
+
+        ### Args:
+        - model (torch.nn.Module): The neural network model to be evaluated.
+        - device (torch.device): The device on which the model is evaluated (CPU or GPU).
+
+        ### Returns:
+        - Tuple[float, Dict[str, float]]: A tuple containing:
+            - float: The evaluation loss (e.g., MSE). This will be used to determine the best model.
+            - Dict[str, float]: A dictionary containing evaluation metrics, such as MAE, MSE, R2, etc.
+        """
         raise NotImplementedError("This method should be overridden in subclasses.")
 
-    # Getter methods for private attributes
-    @property
-    def db_url(self) -> str:
-        return self.__db_url
-    
+    # Make relevant attributes accessible through property getters
     @property
     def study_id(self) -> str:
-        return self.__study_id
+        """Returns the unique identifier for the study."""
+        return self._study_id
     
     @property
-    def n_runs(self) -> int:
-        return self.__n_runs
+    def search_space(self) -> SearchSpace:
+        """Returns the search space for hyperparameters. ((hidden_dim_1, hidden_dim_2, ...), batch_size, epochs, learning_rate, weight_decay)"""
+        return self._search_space.copy()
     
     @property
-    def output_dir(self) -> str:
-        return str(self.__output_dir.absolute())
+    def model_class(self) -> ModelType:
+        """Returns the class of the model to be trained."""
+        return self._model_class
     
     @property
-    def model_class(self) -> Module:
-        return self.__model_class
+    def optimizer_class(self) -> OptimizerType:
+        """Returns the class of the optimizer to be used for training."""
+        return self._optimizer_class
     
     @property
-    def optimizer_class(self) -> Optimizer:
-        return self.__optimizer_class
+    def input_dim(self) -> int:
+        """Returns the input dimension of the model."""
+        return self._input_dim
+    
+    @property
+    def output_dim(self) -> int:
+        """Returns the output dimension of the model."""
+        return self._output_dim
     
     @property
     def debug_mode(self) -> bool:
-        return self.__debug_mode
+        """Returns whether the framework is running in debug mode."""
+        return self._debug_mode
     
-    @property
-    def n_processes(self) -> int:
-        return self.__n_processes

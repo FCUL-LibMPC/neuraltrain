@@ -1,11 +1,16 @@
 import torch
 import pandas as pd
 from typing import Callable, List
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 
 class BasicDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, input_cols: list, target_cols: list):
+    def __init__(self, 
+        df: pd.DataFrame, 
+        input_cols: list, 
+        target_cols: list,
+        device: torch.device = torch.device("cpu")
+    ):
         """
         Initializes the BasicDataset with input and target columns.
 
@@ -19,12 +24,8 @@ class BasicDataset(Dataset):
         self.__target_cols = target_cols.copy()
 
         # Convert input and target data into PyTorch tensors
-        self.input_data = torch.tensor(
-            df[self.__input_cols].values, dtype=torch.float32
-        )
-        self.target_data = torch.tensor(
-            df[self.__target_cols].values, dtype=torch.float32
-        )
+        self.input_data = torch.tensor(df[self.__input_cols].values, dtype=torch.float32, device=device)
+        self.target_data = torch.tensor(df[self.__target_cols].values, dtype=torch.float32, device=device)
 
     def __len__(self):
         return len(self.input_data)
@@ -99,8 +100,8 @@ class TimeSeriesDataset(Dataset):
         period: int,
         input_cols: List[str],
         target_cols: List[str],
-        step_size: int,
-        input_window_size: int
+        input_window_size: int,
+        device: torch.device = torch.device("cpu")
     ):
         """
         Initializes the TimeSeriesDataset with input and target columns.
@@ -110,92 +111,94 @@ class TimeSeriesDataset(Dataset):
         - period (int): The time period (in seconds) for each step in the time series.
         - input_cols (List[str]): Ordered list of column names to be used as input features.
         - target_cols (List[str]): Ordered list of column names to be used as target variables.
-        - step_size (int): The number of hours between the start of each regression window.
         - input_window_size (int): The size in hours for the input array required for a prediction. This will be used to guarantee that the model has enough data to make a prediction for the first step.
-        - prediction_window_size (int): The size in hours for the next prediction window. This will be used to guarantee that the model has enough data to be used in the rest of the evaluation.
         """
         self.steps_per_hour = int(3600 / period)
-        self.df = df.reset_index(drop=True)
         self.input_cols = input_cols.copy()
         self.target_cols = target_cols.copy()
-        self.step_size = int(self.steps_per_hour * step_size)
         self.input_window_size = int(self.steps_per_hour * input_window_size) + 1
-        self.window_size = self.input_window_size
 
+        relevant_columns = list(dict.fromkeys(input_cols + target_cols))
+        self.df = df[relevant_columns].reset_index(drop=True)
+
+        self.num_samples = len(self.df) - self.input_window_size
+        self.num_input_features = len(self.input_cols)
+        self.num_target_features = len(self.target_cols)
+
+        # Alocar tensores
+        self.input_tensor = torch.zeros((self.num_samples, self.input_window_size, self.num_input_features), dtype=torch.float32, device=device)
+        self.target_tensor = torch.zeros((self.num_samples, self.num_target_features), dtype=torch.float32, device=device)
+
+        # Preencher tensores
+        for i in range(self.num_samples):
+            input_window = self.df[self.input_cols].iloc[i : i + self.input_window_size].values
+            target_values = self.df[self.target_cols].iloc[i + self.input_window_size].values
+
+            self.input_tensor[i] = torch.tensor(input_window, dtype=torch.float32, device=device)
+            self.target_tensor[i] = torch.tensor(target_values, dtype=torch.float32, device=device)
 
     def __len__(self):
-        return max(0, (len(self.df) - self.window_size) // self.step_size)
+        return self.num_samples
 
     def __getitem__(self, idx):
-        t = idx * self.step_size + self.input_window_size
+        return self.input_tensor[idx], self.target_tensor[idx]
 
-        # Ensure that have enough data for input for first prediction and the following predictions
-        input_slice = self.df.iloc[t - self.input_window_size : t]
-
-        # Ensure that have enough data for the target for the first prediction and the following predictions
-        target_slice = self.df.iloc[[t]]
-
-        input_tensor = torch.tensor(input_slice[self.input_cols].values, dtype=torch.float32)
-        target_tensor = torch.tensor(target_slice[self.target_cols].values, dtype=torch.float32)
-
-        return input_tensor, target_tensor, self.input_window_size
-    
-    # def get_input_col_index(self, col_name: str) -> int:
-    #     """Return the index of a single input column name."""
-    #     if col_name not in self.input_cols:
-    #         raise ValueError(f"Column '{col_name}' not found in input_cols.")
-    #     return self.input_cols.index(col_name)
-    
-    # def get_target_col_index(self, col_name: str) -> int:
-    #     """Return the index of a single target column name."""
-    #     if col_name not in self.target_cols:
-    #         raise ValueError(f"Column '{col_name}' not found in target_cols.")
-    #     return self.target_cols.index(col_name)
-    
     @classmethod
-    def get_dataloader(
+    def get_dataloaders(
         cls,
         df: pd.DataFrame,
         period: int,
         input_cols: List[str],
         target_cols: List[str],
-        step_size: int = 1,
-        input_window_size: int = 24,
-        prediction_window_size: int = 24,
-        analysis_horizon: int = 183,
-        batch_size: int = 1,
-    ) -> DataLoader:
+        input_window_size: int,
+        train_proportion: float = 0.8,
+        batch_size: int = 254,
+        shuffle: bool = True,
+        seed: int = 42,
+        device: torch.device = torch.device("cpu"),
+    ) -> tuple[DataLoader, DataLoader]:
         """
-        Returns a DataLoader for recursive long-horizon evaluation over the full dataset.
+        Builds a full dataset and splits it using torch.utils.data.Subset.
 
-        Args:
-            df (pd.DataFrame): The full ordered dataframe.
-            input_col_filter (Callable): Function to select input columns.
-            target_col_filter (Callable): Function to select target columns.
-            input_window (int): Number of time steps to use as input.
-            output_horizon (int): Number of time steps to predict.
-            step_size (int): Step size between windows.
-            batch_size (int): Batch size (usually 1).
-            num_workers (int): Number of workers for DataLoader.
-            pin_memory (bool): Whether to pin memory (for GPU performance).
+        ### Args:
+        - df (pd.DataFrame): The full input dataframe.
+        - period (int): Time period in seconds for each step.
+        - input_cols (List[str]): Names of input features.
+        - target_cols (List[str]): Names of target features.
+        - input_window_size (int): Window size in hours for inputs.
+        - train_proportion (float): Proportion of data to use for training.
+        - batch_size (int): Batch size.
+        - shuffle (bool): Whether to shuffle before split.
+        - seed (int): Random seed for reproducibility.
+        - device (torch.device): Device to store tensors (e.g., 'cuda').
 
         Returns:
-            DataLoader: A PyTorch DataLoader yielding (input, target) tuples.
+            tuple[DataLoader, DataLoader]: train and test dataloaders
         """
-        cls: RecursiveEvalDataset
-
-        dataset = cls(
+        # Create full dataset (eager tensors already built)
+        full_dataset = cls(
             df=df,
             period=period,
             input_cols=input_cols,
             target_cols=target_cols,
-            step_size=step_size,
             input_window_size=input_window_size,
-            prediction_window_size=prediction_window_size,
-            analysis_horizon=analysis_horizon,
+            device=device,
         )
 
-        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        num_samples = len(full_dataset)
+        indices = torch.randperm(num_samples, generator=torch.Generator().manual_seed(seed)) if shuffle else torch.arange(num_samples)
+
+        split_idx = int(train_proportion * num_samples)
+        train_indices = indices[:split_idx]
+        test_indices = indices[split_idx:]
+
+        train_subset = Subset(full_dataset, train_indices)
+        test_subset = Subset(full_dataset, test_indices)
+
+        train_dl = DataLoader(train_subset, batch_size=batch_size, shuffle=shuffle)
+        test_dl = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
+
+        return train_dl, test_dl, train_subset, test_subset
 
 class RobustnessEvalDataset(Dataset):
     def __init__(
@@ -208,13 +211,14 @@ class RobustnessEvalDataset(Dataset):
         input_window_size: int,
         prediction_window_size: int,
         analysis_horizon: int,
+        device: torch.device = torch.device("cpu"),
     ):
         """
         Initializes the RecursiveEvalDataset with input and target columns.
         This dataset is designed for recursive long-horizon evaluation, where the model predicts future values 
         by feeding back its own predictions to achieve longer horizon predictions.
 
-        #### Args:
+        ### Args:
         - df (pandas.DataFrame): The dataframe containing the time series data.
         - period (int): The time period (in seconds) for each step in the time series.
         - input_cols (List[str]): Ordered list of column names to be used as input features.
@@ -225,8 +229,6 @@ class RobustnessEvalDataset(Dataset):
         - analysis_horizon (int): The total number of days of the analysis period. This will be used to determine the data window that will be used from the dataset.
         """
         self.steps_per_hour = int(3600 / period)
-        self.df = df.reset_index(drop=True)
-        self.df = self.df.iloc[: int(analysis_horizon * 24 * self.steps_per_hour)]
         self.input_cols = input_cols.copy()
         self.target_cols = target_cols.copy()
         self.step_size = int(self.steps_per_hour * step_size)
@@ -234,35 +236,33 @@ class RobustnessEvalDataset(Dataset):
         self.prediction_window_size = int(self.steps_per_hour * prediction_window_size)
         self.window_size = self.input_window_size + self.prediction_window_size
 
+        relevant_columns = list(dict.fromkeys(input_cols + target_cols))
+        self.df = df[relevant_columns].reset_index(drop=True).iloc[: int(analysis_horizon * 24 * self.steps_per_hour)]
+
+        self.num_samples = (len(self.df) - self.window_size) // self.step_size
+        self.num_input_features = len(self.input_cols)
+        self.num_target_features = len(self.target_cols)
+
+        # Alocar tensores
+        self.input_tensor = torch.zeros((self.num_samples, self.window_size, self.num_input_features), dtype=torch.float32, device=device)
+        self.target_tensor = torch.zeros((self.num_samples, self.prediction_window_size, self.num_target_features), dtype=torch.float32, device=device)
+
+        # Preencher tensores
+        for i in range(self.num_samples):
+            idx = i * self.step_size
+            input_window = self.df[self.input_cols].iloc[idx : idx + self.window_size].values
+            target_values = self.df[self.target_cols].iloc[idx + self.input_window_size + 1 : idx + self.window_size + 1].values
+
+
+            self.input_tensor[i] = torch.tensor(input_window, dtype=torch.float32, device=device)
+            self.target_tensor[i] = torch.tensor(target_values, dtype=torch.float32, device=device)
+
 
     def __len__(self):
-        return max(0, (len(self.df) - self.window_size) // self.step_size)
+        return self.num_samples
 
     def __getitem__(self, idx):
-        t = idx * self.step_size + self.input_window_size
-
-        # Ensure that have enough data for input for first prediction and the following predictions
-        input_slice = self.df.iloc[t - self.input_window_size : t + self.prediction_window_size]
-
-        # Ensure that have enough data for the target for the first prediction and the following predictions
-        target_slice = self.df.iloc[t : t + self.prediction_window_size]
-
-        input_tensor = torch.tensor(input_slice[self.input_cols].values, dtype=torch.float32)
-        target_tensor = torch.tensor(target_slice[self.target_cols].values, dtype=torch.float32)
-
-        return input_tensor, target_tensor, self.input_window_size
-    
-    # def get_input_col_index(self, col_name: str) -> int:
-    #     """Return the index of a single input column name."""
-    #     if col_name not in self.input_cols:
-    #         raise ValueError(f"Column '{col_name}' not found in input_cols.")
-    #     return self.input_cols.index(col_name)
-    
-    # def get_target_col_index(self, col_name: str) -> int:
-    #     """Return the index of a single target column name."""
-    #     if col_name not in self.target_cols:
-    #         raise ValueError(f"Column '{col_name}' not found in target_cols.")
-    #     return self.target_cols.index(col_name)
+        return self.input_tensor[idx].clone(), self.target_tensor[idx].clone(), int(self.input_window_size)
     
     @classmethod
     def get_dataloader(
@@ -276,7 +276,7 @@ class RobustnessEvalDataset(Dataset):
         prediction_window_size: int = 24,
         analysis_horizon: int = 183,
         shuffle: bool = True,
-        batch_size: int = 5,
+        device: torch.device = torch.device("cpu"),
     ) -> DataLoader:
         """
         Returns a DataLoader for recursive long-horizon evaluation over the full dataset.
@@ -291,7 +291,7 @@ class RobustnessEvalDataset(Dataset):
         - prediction_window_size (int): The size in hours for the next prediction window.
         - analysis_horizon (int): The total number of days of the analysis period.
         - shuffle (bool): Tells torch to shuffle the dataset when iterating over it.
-        - batch_size (int): The number of samples per batch to load.
+        - device (torch.device): The device to store tensors (e.g., 'cuda' or 'cpu').
 
         ### Returns:
         - DataLoader: A PyTorch DataLoader yielding (input, target) tuples.
@@ -306,11 +306,48 @@ class RobustnessEvalDataset(Dataset):
             input_window_size=input_window_size,
             prediction_window_size=prediction_window_size,
             analysis_horizon=analysis_horizon,
+            device=device,
         )
 
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+        batch_size = len(dataset)
 
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle), dataset
+    
 if __name__ == "__main__":
+    df = pd.read_csv("library2024_simulation_dataset_normalized.csv", index_col="Timestamp", parse_dates=True)
+    input_cols = ["Tz", "Tout", "WindSpd", "GHI", "Thvac", "RTUsouth", "win1", "win2", "win3", "win5"]
+    target_cols = ["Tz", "Ehvac"]
+
+    dataset = RobustnessEvalDataset(
+        df=df,
+        period=300,
+        input_cols=input_cols,
+        target_cols=target_cols,
+        step_size=1,
+        input_window_size=24,
+        prediction_window_size=24,
+        analysis_horizon=183,
+    )
+
+    inputs, targets = dataset[0]
+    print(f"Input shape: {inputs.shape}, Target shape: {targets.shape}")
+    print(inputs)
+    print(targets)
+
+if __name__ == "__main__3132131":
+    df = pd.read_csv("library2024_simulation_dataset_normalized.csv", index_col="Timestamp", parse_dates=True)
+    input_cols = ["Tz", "Tout", "WindSpd", "GHI", "Thvac", "RTUsouth", "win1", "win2", "win3", "win5"]
+    target_cols = ["Tz", "Ehvac"]
+
+    dataset = TimeSeriesDataset(
+        df=df,
+        period=300,
+        input_cols=input_cols,
+        target_cols=target_cols,
+        input_window_size=24,
+    )
+
+if __name__ == "__main__dasdsa":
     from torchmetrics.regression import MeanAbsoluteError
 
     # TEST RecursiveEvalDataset WITH DUMMY DATA

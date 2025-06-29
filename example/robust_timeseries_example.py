@@ -241,8 +241,7 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
             input_cols=self.input_cols,
             target_cols=self.target_cols,
             input_window_size=24,
-            train_proportion=state.train_proportion,
-            device=device,
+            train_proportion=state.train_proportion
         )
 
         self.logger.info("Loading robust dataset...")
@@ -278,7 +277,6 @@ if __name__ == "__main__":
     batch_sizes = [16]
     epochs_list = [100]
     learning_rates = [1e-3]
-    weight_decays = [1e-4]
     train_proportions = [0.8]
 
     # Build search space as a list of tuples with all combinations
@@ -287,9 +285,12 @@ if __name__ == "__main__":
         batch_sizes,
         epochs_list,
         learning_rates,
-        weight_decays,
         train_proportions
     ))
+    search_space = [
+        (hidden_layers, batch_size, epochs, learning_rate, learning_rate/epochs, train_proportion)
+        for (hidden_layers, batch_size, epochs, learning_rate, train_proportion) in search_space
+    ]
 
     # Configure the study
     study_config = StudyConfig(

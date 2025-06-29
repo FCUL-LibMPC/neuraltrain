@@ -100,8 +100,7 @@ class TimeSeriesDataset(Dataset):
         period: int,
         input_cols: List[str],
         target_cols: List[str],
-        input_window_size: int,
-        device: torch.device = torch.device("cpu")
+        input_window_size: int
     ):
         """
         Initializes the TimeSeriesDataset with input and target columns.
@@ -126,16 +125,16 @@ class TimeSeriesDataset(Dataset):
         self.num_target_features = len(self.target_cols)
 
         # Alocar tensores
-        self.input_tensor = torch.zeros((self.num_samples, self.input_window_size, self.num_input_features), dtype=torch.float32, device=device)
-        self.target_tensor = torch.zeros((self.num_samples, self.num_target_features), dtype=torch.float32, device=device)
+        self.input_tensor = torch.zeros((self.num_samples, self.input_window_size, self.num_input_features), dtype=torch.float32)
+        self.target_tensor = torch.zeros((self.num_samples, self.num_target_features), dtype=torch.float32)
 
         # Preencher tensores
         for i in range(self.num_samples):
             input_window = self.df[self.input_cols].iloc[i : i + self.input_window_size].values
             target_values = self.df[self.target_cols].iloc[i + self.input_window_size].values
 
-            self.input_tensor[i] = torch.tensor(input_window, dtype=torch.float32, device=device)
-            self.target_tensor[i] = torch.tensor(target_values, dtype=torch.float32, device=device)
+            self.input_tensor[i] = torch.tensor(input_window, dtype=torch.float32)
+            self.target_tensor[i] = torch.tensor(target_values, dtype=torch.float32)
 
     def __len__(self):
         return self.num_samples
@@ -210,8 +209,7 @@ class RobustnessEvalDataset(Dataset):
         step_size: int,
         input_window_size: int,
         prediction_window_size: int,
-        analysis_horizon: int,
-        device: torch.device = torch.device("cpu"),
+        analysis_horizon: int
     ):
         """
         Initializes the RecursiveEvalDataset with input and target columns.
@@ -244,8 +242,8 @@ class RobustnessEvalDataset(Dataset):
         self.num_target_features = len(self.target_cols)
 
         # Alocar tensores
-        self.input_tensor = torch.zeros((self.num_samples, self.window_size, self.num_input_features), dtype=torch.float32, device=device)
-        self.target_tensor = torch.zeros((self.num_samples, self.prediction_window_size, self.num_target_features), dtype=torch.float32, device=device)
+        self.input_tensor = torch.zeros((self.num_samples, self.window_size, self.num_input_features), dtype=torch.float32)
+        self.target_tensor = torch.zeros((self.num_samples, self.prediction_window_size, self.num_target_features), dtype=torch.float32)
 
         # Preencher tensores
         for i in range(self.num_samples):
@@ -253,9 +251,8 @@ class RobustnessEvalDataset(Dataset):
             input_window = self.df[self.input_cols].iloc[idx : idx + self.window_size].values
             target_values = self.df[self.target_cols].iloc[idx + self.input_window_size + 1 : idx + self.window_size + 1].values
 
-
-            self.input_tensor[i] = torch.tensor(input_window, dtype=torch.float32, device=device)
-            self.target_tensor[i] = torch.tensor(target_values, dtype=torch.float32, device=device)
+            self.input_tensor[i] = torch.tensor(input_window, dtype=torch.float32)
+            self.target_tensor[i] = torch.tensor(target_values, dtype=torch.float32)
 
 
     def __len__(self):

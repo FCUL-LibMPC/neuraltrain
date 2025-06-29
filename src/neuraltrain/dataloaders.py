@@ -8,8 +8,7 @@ class BasicDataset(Dataset):
     def __init__(self, 
         df: pd.DataFrame, 
         input_cols: list, 
-        target_cols: list,
-        device: torch.device = torch.device("cpu")
+        target_cols: list
     ):
         """
         Initializes the BasicDataset with input and target columns.
@@ -24,8 +23,8 @@ class BasicDataset(Dataset):
         self.__target_cols = target_cols.copy()
 
         # Convert input and target data into PyTorch tensors
-        self.input_data = torch.tensor(df[self.__input_cols].values, dtype=torch.float32, device=device)
-        self.target_data = torch.tensor(df[self.__target_cols].values, dtype=torch.float32, device=device)
+        self.input_data = torch.tensor(df[self.__input_cols].values, dtype=torch.float32)
+        self.target_data = torch.tensor(df[self.__target_cols].values, dtype=torch.float32)
 
     def __len__(self):
         return len(self.input_data)
@@ -259,7 +258,7 @@ class RobustnessEvalDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        return self.input_tensor[idx].clone(), self.target_tensor[idx].clone(), int(self.input_window_size)
+        return self.input_tensor[idx], self.target_tensor[idx], int(self.input_window_size)
     
     @classmethod
     def get_dataloader(

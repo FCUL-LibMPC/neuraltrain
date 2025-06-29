@@ -90,8 +90,11 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
         model.train()
 
         for inputs, targets in self.train_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+
             # Mask lags to produce model-ready inputs; Shape: [BATCH_ROWS, LAGGED_INPUTS]
             masked_input = self.apply_lag_mask(inputs, self.lag_config, self.input_cols)
+            masked_input = masked_input.to(device)
 
             outputs = model(masked_input)
 
@@ -150,8 +153,11 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
         model.eval()
 
         for inputs, targets in self.test_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+
             # Mask lags to produce model-ready inputs; Shape: [BATCH_ROWS, LAGGED_INPUTS]
             masked_input = self.apply_lag_mask(inputs, self.lag_config, self.input_cols)
+            masked_input = masked_input.to(device)
 
             outputs = model(masked_input)
 
@@ -173,6 +179,8 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
             real_mse_metric.update(outputs_real, targets_real)
 
         for input_history, targets, input_size in self.robust_dl:
+            input_history, targets = input_history.to(device), targets.to(device)
+
             input_size = input_size[0].item()  # Get the input size from the batch, equal to all rows
             predictions = torch.zeros(targets.shape, device=device)     # Shape: [BATCH_ROWS, PREDICTION_WINDOW, VARIABLES]
             tz_input_idx = self.input_cols.index("Tz")
@@ -180,6 +188,8 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
             for i in range(int(targets.shape[1])):
                 # Mask lags to produce model-ready inputs; Shape: [BATCH_ROWS, LAGGED_INPUTS]
                 masked_input = self.apply_lag_mask(input_history[:, i:i + input_size, :], self.lag_config, self.input_cols)
+                masked_input = masked_input.to(device)
+                
                 outputs = model(masked_input)
 
                 # Store predicted values to predictions tensor

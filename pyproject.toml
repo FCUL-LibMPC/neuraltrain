@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuraltrain"
-version = "0.6.2"
+version = "0.6.3"
 description = "A neural network training framework leveraging Optuna for hyperparameter optimization and parallelism."
 readme = "README.md"
 license = {text = "MIT"}

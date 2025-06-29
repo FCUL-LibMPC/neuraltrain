@@ -89,8 +89,11 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
         model.train()
 
         for inputs, targets in self.train_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+
             # Mask lags to produce model-ready inputs; Shape: [BATCH_ROWS, LAGGED_INPUTS]
             masked_input = self.apply_lag_mask(inputs, self.lag_config, self.input_cols)
+            masked_input = masked_input.to(device)
 
             outputs = model(masked_input)
 
@@ -149,8 +152,11 @@ class TestTrainingFramework(NeuralNetworkTrainFramework):
         model.eval()
 
         for inputs, targets in self.test_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+
             # Mask lags to produce model-ready inputs; Shape: [BATCH_ROWS, LAGGED_INPUTS]
             masked_input = self.apply_lag_mask(inputs, self.lag_config, self.input_cols)
+            masked_input = masked_input.to(device)
 
             outputs = model(masked_input)
 

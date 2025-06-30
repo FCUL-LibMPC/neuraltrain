@@ -301,7 +301,6 @@ class RobustnessEvalDataset(Dataset):
             input_window_size=input_window_size,
             prediction_window_size=prediction_window_size,
             analysis_horizon=analysis_horizon,
-            device=device,
         )
 
         batch_size = len(dataset)

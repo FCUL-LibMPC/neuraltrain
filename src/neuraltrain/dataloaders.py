@@ -180,7 +180,6 @@ class TimeSeriesDataset(Dataset):
             input_cols=input_cols,
             target_cols=target_cols,
             input_window_size=input_window_size,
-            device=device,
         )
 
         num_samples = len(full_dataset)
